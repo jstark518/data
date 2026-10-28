@@ -1,0 +1,132 @@
+{{- if .Values.flink.enabled }}
+# A long-running SESSION cluster: a multi-tenant Flink runtime you submit many jobs to, as
+# opposed to an application cluster (one job, one cluster). Submit work as FlinkSessionJob CRs
+# or with `flink run` against the REST endpoint.
+apiVersion: flink.apache.org/v1beta1
+kind: FlinkDeployment
+metadata:
+  name: {{ .Values.flink.name }}
+  namespace: {{ .Values.flink.namespace }}
+  labels:
+    {{- include "streaming-platform.labels" . | nindent 4 }}
+spec:
+  image: {{ .Values.flink.image }}
+  flinkVersion: {{ .Values.flink.flinkVersion }}
+  serviceAccount: {{ .Values.flink.serviceAccount }}
+  flinkConfiguration:
+    taskmanager.numberOfTaskSlots: {{ .Values.flink.taskSlotsPerTaskManager | quote }}
+    {{- if .Values.flink.highAvailability.enabled }}
+    # Kubernetes-native HA (no ZooKeeper): JobManagers elect a leader through ConfigMaps, and
+    # shared state lives on object storage. Required for jobManagerReplicas > 1.
+    high-availability.type: {{ .Values.flink.highAvailability.type }}
+    high-availability.storageDir: {{ .Values.flink.highAvailability.storageDir }}
+    {{- end }}
+    state.checkpoints.dir: {{ .Values.flink.state.checkpointsDir }}
+    state.savepoints.dir: {{ .Values.flink.state.savepointsDir }}
+    execution.checkpointing.interval: {{ .Values.flink.checkpointing.interval | quote }}
+    restart-strategy.type: {{ .Values.flink.restartStrategy }}
+    {{- if .Values.flink.s3.enabled }}
+    {{- if .Values.flink.s3.endpoint }}
+    s3.endpoint: {{ .Values.flink.s3.endpoint }}
+    {{- end }}
+    s3.path.style.access: {{ .Values.flink.s3.pathStyleAccess | quote }}
+    {{- end }}
+    {{- if .Values.flink.metrics.prometheus.enabled }}
+    metrics.reporter.prom.factory.class: org.apache.flink.metrics.prometheus.PrometheusReporterFactory
+    metrics.reporter.prom.port: {{ .Values.flink.metrics.prometheus.port | quote }}
+    {{- end }}
+    {{- with .Values.flink.extraConfiguration }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  podTemplate:
+    metadata:
+      {{- if .Values.flink.metrics.prometheus.enabled }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: {{ .Values.flink.metrics.prometheus.port | quote }}
+        prometheus.io/path: "/metrics"
+      {{- end }}
+    spec:
+      {{- if .Values.flink.podAntiAffinity }}
+      # Spread a job's parallel TaskManagers across distinct nodes: its subtasks then genuinely
+      # exchange data over the network, and one node failing cannot take out every subtask.
+      # Soft (preferred), so scheduling still succeeds when nodes < TaskManagers.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    component: taskmanager
+      {{- end }}
+      containers:
+        - name: flink-main-container
+          {{- if .Values.flink.s3.enabled }}
+          env:
+            # Moves the bundled S3 filesystem jar from /opt/flink/opt into /opt/flink/plugins at
+            # startup. The jar name is version-specific — it changes when you change `image`.
+            - name: ENABLE_BUILT_IN_PLUGINS
+              value: {{ .Values.flink.s3.builtInPlugin }}
+            {{- if .Values.flink.s3.existingSecret }}
+            # Credentials via the standard AWS_* chain, so no keys live in the manifest.
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.flink.s3.existingSecret }}
+                  key: {{ .Values.flink.s3.accessKeyKey }}
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.flink.s3.existingSecret }}
+                  key: {{ .Values.flink.s3.secretKeyKey }}
+            {{- end }}
+          {{- end }}
+  jobManager:
+    replicas: {{ .Values.flink.jobManagerReplicas }}
+    resource:
+      {{- toYaml .Values.flink.resources.jobManager | nindent 6 }}
+  taskManager:
+    # In session mode the Flink resource manager allocates TaskManager pods on demand as jobs
+    # are submitted; this only sets each one's profile.
+    resource:
+      {{- toYaml .Values.flink.resources.taskManager | nindent 6 }}
+{{- if .Values.flink.ingress.enabled }}
+---
+# ⚠️ The Flink REST endpoint accepts JOB SUBMISSIONS. Exposing it unauthenticated lets anyone
+# who can reach it run arbitrary code on this cluster. Put an authenticating proxy in front, or
+# keep it on a trusted network.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ .Values.flink.name }}
+  namespace: {{ .Values.flink.namespace }}
+  labels:
+    {{- include "streaming-platform.labels" . | nindent 4 }}
+  {{- with .Values.flink.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.flink.ingress.className }}
+  {{- if .Values.flink.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ required "flink.ingress.host is required when the ingress is enabled" .Values.flink.ingress.host }}
+      secretName: {{ .Values.flink.ingress.tls.secretName | default (printf "%s-tls" .Values.flink.name) }}
+  {{- end }}
+  rules:
+    - host: {{ required "flink.ingress.host is required when the ingress is enabled" .Values.flink.ingress.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                # The Flink operator creates <name>-rest on :8081.
+                name: {{ .Values.flink.name }}-rest
+                port:
+                  number: 8081
+{{- end }}
+{{- end }}

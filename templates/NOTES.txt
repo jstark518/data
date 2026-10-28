@@ -1,0 +1,77 @@
+{{ .Chart.Name }} {{ .Chart.Version }} installed as "{{ .Release.Name }}".
+
+This chart deploys CUSTOM RESOURCES. If the Kafka or Flink objects were rejected, the matching
+operator is not installed — see "Prerequisites" in the chart README.
+
+{{ if .Values.kafka.enabled -}}
+KAFKA ({{ .Values.kafka.namespace }})
+  Wait for it (a change that rolls the brokers can take several minutes):
+    kubectl -n {{ .Values.kafka.namespace }} wait kafka/{{ .Values.kafka.clusterName }} --for=condition=Ready --timeout=600s
+
+  In-cluster bootstrap:
+    {{ include "streaming-platform.kafkaBootstrap" . }}
+{{ if .Values.kafka.listeners.external.enabled }}
+  External bootstrap (assigned by your load balancer, so read it from the status):
+    kubectl -n {{ .Values.kafka.namespace }} get kafka {{ .Values.kafka.clusterName }} \
+      -o jsonpath='{.status.listeners[?(@.name=="{{ .Values.kafka.listeners.external.name }}")].bootstrapServers}'
+{{- if not .Values.kafka.listeners.external.tls }}
+
+  ⚠️ The external listener is PLAINTEXT with no authentication. Anyone who can reach that
+     address can read, write and delete every topic. Only acceptable on a trusted network.
+{{- end }}
+{{- end }}
+
+  Produce and consume a test message:
+    kubectl -n {{ .Values.kafka.namespace }} run kcat -it --rm --restart=Never \
+      --image=quay.io/strimzi/kafka:latest-kafka-{{ .Values.kafka.version }} -- \
+      bin/kafka-console-producer.sh --bootstrap-server {{ .Values.kafka.clusterName }}-kafka-bootstrap:9092 --topic {{ (first .Values.kafka.topics).name | default "smoke-test" }}
+{{ end }}
+{{- if .Values.flink.enabled }}
+FLINK ({{ .Values.flink.namespace }})
+  Wait for it:
+    kubectl -n {{ .Values.flink.namespace }} wait flinkdeployment/{{ .Values.flink.name }} \
+      --for=jsonpath='{.status.jobManagerDeploymentStatus}'=READY --timeout=300s
+
+  Web UI / REST:
+{{- if .Values.flink.ingress.enabled }}
+    http{{ if .Values.flink.ingress.tls.enabled }}s{{ end }}://{{ .Values.flink.ingress.host }}
+
+  ⚠️ That endpoint accepts JOB SUBMISSIONS and is unauthenticated. Anyone who can reach it can
+     run arbitrary code on this cluster.
+{{- else }}
+    kubectl -n {{ .Values.flink.namespace }} port-forward svc/{{ .Values.flink.name }}-rest 8081:8081
+    then http://localhost:8081
+{{- end }}
+
+  Submit a job as a FlinkSessionJob pointing at deploymentName: {{ .Values.flink.name }}.
+{{- if .Values.flink.s3.enabled }}
+
+  This expects a Secret "{{ .Values.flink.s3.existingSecret }}" in {{ .Values.flink.namespace }}
+  with keys "{{ .Values.flink.s3.accessKeyKey }}" and "{{ .Values.flink.s3.secretKeyKey }}".
+  Without it the JobManagers cannot write HA state and will crash-loop:
+    kubectl -n {{ .Values.flink.namespace }} create secret generic {{ .Values.flink.s3.existingSecret }} \
+      --from-literal={{ .Values.flink.s3.accessKeyKey }}=... --from-literal={{ .Values.flink.s3.secretKeyKey }}=...
+{{- end }}
+{{ end }}
+{{- if .Values.elasticsearch.enabled }}
+ELASTICSEARCH ({{ .Values.elasticsearch.namespace }})
+    kubectl -n {{ .Values.elasticsearch.namespace }} rollout status statefulset/elasticsearch --timeout=300s
+    kubectl -n {{ .Values.elasticsearch.namespace }} port-forward svc/elasticsearch 9200:9200
+{{- if not .Values.elasticsearch.security.enabled }}
+
+  ⚠️ Security is DISABLED: plain HTTP, no authentication. Anyone who can reach :9200 can read,
+     write and DELETE every index.
+{{- end }}
+{{ end }}
+{{- if .Values.kibana.enabled }}
+KIBANA
+{{- if .Values.kibana.ingress.enabled }}
+    http{{ if .Values.kibana.ingress.tls.enabled }}s{{ end }}://{{ .Values.kibana.ingress.host }}
+{{- else }}
+    kubectl -n {{ .Values.elasticsearch.namespace }} port-forward svc/kibana 5601:5601
+    then http://localhost:5601
+{{- end }}
+{{ end }}
+UNINSTALLING
+  Namespaces and Kafka PVCs are kept on purpose, so `helm uninstall` cannot take your data with
+  it. Remove them deliberately when you actually mean to.

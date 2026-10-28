@@ -1,0 +1,156 @@
+{{- if .Values.kafka.enabled }}
+{{- if .Values.kafka.metrics.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kafka-metrics
+  namespace: {{ .Values.kafka.namespace }}
+  labels:
+    {{- include "streaming-platform.labels" . | nindent 4 }}
+data:
+  # JMX Prometheus Exporter rules, vendored from the upstream Strimzi example. Referenced below
+  # via spec.kafka.metricsConfig; broker pods then expose metrics on :9404 (tcp-prometheus).
+  # Bump alongside the Strimzi version.
+  kafka-metrics-config.yml: |
+{{ .Files.Get "files/kafka-metrics-config.yml" | indent 4 }}
+---
+{{- end }}
+# Dual-role nodes: each is BOTH a KRaft controller and a broker, so a single pool keeps the
+# metadata quorum AND replica leadership through the loss of any one node.
+#
+# Strimzi 1.0+ uses kafka.strimzi.io/v1 and REQUIRES node pools — older v1beta2 / ZooKeeper-era
+# manifests will not apply against it.
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaNodePool
+metadata:
+  name: dual-role
+  namespace: {{ .Values.kafka.namespace }}
+  labels:
+    strimzi.io/cluster: {{ .Values.kafka.clusterName }}
+    {{- include "streaming-platform.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.kafka.replicas }}
+  roles:
+    - controller
+    - broker
+  storage:
+    type: jbod
+    volumes:
+      - id: 0
+        type: persistent-claim
+        size: {{ .Values.kafka.storage.size }}
+        {{- $sc := include "streaming-platform.storageClass" (dict "local" .Values.kafka.storage.storageClass "global" .Values.global.storageClass) }}
+        {{- if $sc }}
+        class: {{ $sc }}
+        {{- end }}
+        # Keep the KRaft metadata log on the same volume as the data.
+        kraftMetadata: shared
+        # false means the PVC survives a scale-down or a pool delete. Your data outlives Helm.
+        deleteClaim: {{ .Values.kafka.storage.deleteClaim }}
+  resources:
+    {{- toYaml .Values.kafka.resources | nindent 4 }}
+  template:
+    pod:
+      {{- if .Values.kafka.podAntiAffinity }}
+      # Spread nodes across hosts, so losing one host cannot take out more than one node —
+      # i.e. it can never break the KRaft quorum. Soft, so scheduling still succeeds when
+      # there are fewer nodes than replicas.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    strimzi.io/cluster: {{ .Values.kafka.clusterName }}
+      {{- else }}
+      {}
+      {{- end }}
+---
+apiVersion: kafka.strimzi.io/v1
+kind: Kafka
+metadata:
+  name: {{ .Values.kafka.clusterName }}
+  namespace: {{ .Values.kafka.namespace }}
+  labels:
+    {{- include "streaming-platform.labels" . | nindent 4 }}
+spec:
+  kafka:
+    version: {{ .Values.kafka.version | quote }}
+    metadataVersion: {{ .Values.kafka.metadataVersion | quote }}
+    listeners:
+      {{- if .Values.kafka.listeners.plain }}
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+      {{- end }}
+      {{- if .Values.kafka.listeners.tls }}
+      - name: tls
+        port: 9093
+        type: internal
+        tls: true
+      {{- end }}
+      {{- if .Values.kafka.listeners.external.enabled }}
+      # Reachable from outside the cluster. Read the assigned address from the Kafka CR status:
+      #   kubectl -n {{ .Values.kafka.namespace }} get kafka {{ .Values.kafka.clusterName }} \
+      #     -o jsonpath='{.status.listeners[?(@.name=="{{ .Values.kafka.listeners.external.name }}")].bootstrapServers}'
+      - name: {{ .Values.kafka.listeners.external.name }}
+        port: {{ .Values.kafka.listeners.external.port }}
+        type: {{ .Values.kafka.listeners.external.type }}
+        tls: {{ .Values.kafka.listeners.external.tls }}
+        {{- with .Values.kafka.listeners.external.extraListenerConfig }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- end }}
+    config:
+      offsets.topic.replication.factor: {{ .Values.kafka.config.offsetsTopicReplicationFactor }}
+      transaction.state.log.replication.factor: {{ .Values.kafka.config.transactionStateLogReplicationFactor }}
+      transaction.state.log.min.isr: {{ .Values.kafka.config.transactionStateLogMinIsr }}
+      default.replication.factor: {{ .Values.kafka.config.defaultReplicationFactor }}
+      min.insync.replicas: {{ .Values.kafka.config.minInsyncReplicas }}
+      {{- with .Values.kafka.extraConfig }}
+      {{- toYaml . | nindent 6 }}
+      {{- end }}
+    {{- if .Values.kafka.metrics.enabled }}
+    metricsConfig:
+      type: jmxPrometheusExporter
+      valueFrom:
+        configMapKeyRef:
+          name: kafka-metrics
+          key: kafka-metrics-config.yml
+    {{- end }}
+  {{- if .Values.kafka.metrics.kafkaExporter.enabled }}
+  # Consumer-group lag and offset metrics, as a separate exporter Deployment. This is the one
+  # that tells you a consumer is falling behind.
+  kafkaExporter:
+    topicRegex: {{ .Values.kafka.metrics.kafkaExporter.topicRegex | quote }}
+    groupRegex: {{ .Values.kafka.metrics.kafkaExporter.groupRegex | quote }}
+  {{- end }}
+  entityOperator:
+    {{- if .Values.kafka.entityOperator.topicOperator }}
+    topicOperator: {}
+    {{- end }}
+    {{- if .Values.kafka.entityOperator.userOperator }}
+    userOperator: {}
+    {{- end }}
+{{- range .Values.kafka.topics }}
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: {{ .name }}
+  namespace: {{ $.Values.kafka.namespace }}
+  labels:
+    strimzi.io/cluster: {{ $.Values.kafka.clusterName }}
+    {{- include "streaming-platform.labels" $ | nindent 4 }}
+spec:
+  partitions: {{ .partitions }}
+  replicas: {{ .replicas }}
+  {{- with .config }}
+  config:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- end }}
+{{- end }}

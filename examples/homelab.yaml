@@ -1,0 +1,61 @@
+# The configuration this chart was extracted from: a Talos homelab on Ceph, with a LAN-facing
+# Kafka listener for an off-cluster edge producer and Ceph RGW as the S3 backend for Flink.
+#
+# Note the security posture — plaintext Kafka, unauthenticated Flink REST and Elasticsearch —
+# which is a deliberate choice for a trusted LAN segment, not a default to copy blindly.
+global:
+  storageClass: ceph-rbd
+
+kafka:
+  listeners:
+    external:
+      enabled: true
+      # Keep the existing name: the CI pipeline reads .status.listeners[?(@.name=="lan")],
+      # and renaming a listener makes Strimzi reconfigure the brokers.
+      name: lan
+      port: 9094
+      type: loadbalancer
+      tls: false
+  topics:
+    - name: smoke-test
+      partitions: 3
+      replicas: 3
+      config:
+        retention.ms: "604800000"
+    - name: vehicle-events
+      partitions: 3
+      replicas: 3
+      config:
+        retention.ms: "604800000"
+
+flink:
+  highAvailability:
+    storageDir: s3://flink/ha
+  state:
+    checkpointsDir: s3://flink/checkpoints
+    savepointsDir: s3://flink/savepoints
+  s3:
+    endpoint: http://s3.starkve.net
+    pathStyleAccess: true
+    existingSecret: flink-s3
+  ingress:
+    enabled: true
+    className: nginx
+    host: flink.app.k8s.starkve.net
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+    tls:
+      enabled: true
+      secretName: flink-tls
+
+kibana:
+  publicBaseUrl: https://kibana.app.k8s.starkve.net
+  ingress:
+    enabled: true
+    className: nginx
+    host: kibana.app.k8s.starkve.net
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+    tls:
+      enabled: true
+      secretName: kibana-tls

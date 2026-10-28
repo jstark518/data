@@ -1,0 +1,112 @@
+{{- if .Values.kibana.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kibana
+  namespace: {{ .Values.elasticsearch.namespace }}
+  labels:
+    {{- include "streaming-platform.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kibana
+  template:
+    metadata:
+      labels:
+        app: kibana
+        {{- include "streaming-platform.labels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: kibana
+          # MUST match the Elasticsearch version exactly — Kibana refuses to start against a
+          # mismatched cluster.
+          image: {{ .Values.kibana.image }}
+          env:
+            - name: ELASTICSEARCH_HOSTS
+              value: {{ include "streaming-platform.esHosts" . | quote }}
+            - name: SERVER_HOST
+              value: "0.0.0.0"
+            {{- if .Values.kibana.publicBaseUrl }}
+            - name: SERVER_PUBLICBASEURL
+              value: {{ .Values.kibana.publicBaseUrl | quote }}
+            - name: SERVER_NAME
+              value: {{ .Values.kibana.publicBaseUrl | trimPrefix "https://" | trimPrefix "http://" | quote }}
+            {{- end }}
+            {{- if .Values.kibana.elasticsearch.existingSecret }}
+            - name: ELASTICSEARCH_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.kibana.elasticsearch.existingSecret }}
+                  key: username
+            - name: ELASTICSEARCH_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.kibana.elasticsearch.existingSecret }}
+                  key: password
+            {{- end }}
+            {{- with .Values.kibana.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 5601
+          resources:
+            {{- toYaml .Values.kibana.resources | nindent 12 }}
+          readinessProbe:
+            httpGet:
+              path: /api/status
+              port: 5601
+            # Kibana's first start includes migrations; it is genuinely slow.
+            initialDelaySeconds: 40
+            periodSeconds: 10
+            failureThreshold: 30
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kibana
+  namespace: {{ .Values.elasticsearch.namespace }}
+  labels:
+    {{- include "streaming-platform.labels" . | nindent 4 }}
+spec:
+  selector:
+    app: kibana
+  ports:
+    - name: http
+      port: 5601
+      targetPort: 5601
+{{- if .Values.kibana.ingress.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: kibana
+  namespace: {{ .Values.elasticsearch.namespace }}
+  labels:
+    {{- include "streaming-platform.labels" . | nindent 4 }}
+  {{- with .Values.kibana.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  ingressClassName: {{ .Values.kibana.ingress.className }}
+  {{- if .Values.kibana.ingress.tls.enabled }}
+  tls:
+    - hosts:
+        - {{ required "kibana.ingress.host is required when the ingress is enabled" .Values.kibana.ingress.host }}
+      secretName: {{ .Values.kibana.ingress.tls.secretName | default "kibana-tls" }}
+  {{- end }}
+  rules:
+    - host: {{ required "kibana.ingress.host is required when the ingress is enabled" .Values.kibana.ingress.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: kibana
+                port:
+                  number: 5601
+{{- end }}
+{{- end }}

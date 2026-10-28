@@ -1,0 +1,95 @@
+{{- if .Values.elasticsearch.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: elasticsearch
+  namespace: {{ .Values.elasticsearch.namespace }}
+  labels:
+    {{- include "streaming-platform.labels" . | nindent 4 }}
+spec:
+  selector:
+    app: elasticsearch
+  ports:
+    - name: http
+      port: 9200
+      targetPort: 9200
+    - name: transport
+      port: 9300
+      targetPort: 9300
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: elasticsearch
+  namespace: {{ .Values.elasticsearch.namespace }}
+  labels:
+    {{- include "streaming-platform.labels" . | nindent 4 }}
+spec:
+  serviceName: elasticsearch
+  replicas: 1
+  selector:
+    matchLabels:
+      app: elasticsearch
+  template:
+    metadata:
+      labels:
+        app: elasticsearch
+        {{- include "streaming-platform.labels" . | nindent 8 }}
+    spec:
+      securityContext:
+        # ES runs as uid/gid 1000; this makes the mounted data directory group-writable.
+        fsGroup: 1000
+      containers:
+        - name: elasticsearch
+          image: {{ .Values.elasticsearch.image }}
+          env:
+            {{- if .Values.elasticsearch.singleNode }}
+            # single-node also bypasses ES's bootstrap checks, so a low vm.max_map_count on the
+            # node does not block startup.
+            - name: discovery.type
+              value: single-node
+            {{- end }}
+            - name: xpack.security.enabled
+              value: {{ .Values.elasticsearch.security.enabled | quote }}
+            - name: bootstrap.memory_lock
+              value: "false"
+            - name: ES_JAVA_OPTS
+              value: {{ .Values.elasticsearch.javaOpts | quote }}
+            {{- with .Values.elasticsearch.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            - name: http
+              containerPort: 9200
+            - name: transport
+              containerPort: 9300
+          resources:
+            {{- toYaml .Values.elasticsearch.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /usr/share/elasticsearch/data
+          readinessProbe:
+            httpGet:
+              path: "/_cluster/health?local=true"
+              port: 9200
+              {{- if .Values.elasticsearch.security.enabled }}
+              scheme: HTTPS
+              {{- end }}
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            # Generous: a cold ES on slow storage can take minutes on first start.
+            failureThreshold: 30
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes:
+          - ReadWriteOnce
+        {{- $sc := include "streaming-platform.storageClass" (dict "local" .Values.elasticsearch.storage.storageClass "global" .Values.global.storageClass) }}
+        {{- if $sc }}
+        storageClassName: {{ $sc }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.elasticsearch.storage.size }}
+{{- end }}

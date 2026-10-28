@@ -1,0 +1,274 @@
+# Default values for streaming-platform.
+#
+# Every component can be switched off independently — take only the pieces you need.
+#
+# The defaults are a small, honest homelab posture: unauthenticated HTTP on a trusted LAN,
+# single-node Elasticsearch, modest resources. They are NOT production-safe as-is; the places
+# that matter are called out inline and in the README's "Before you expose this" section.
+
+global:
+  # -- Block StorageClass (ReadWriteOnce) used by Kafka and Elasticsearch. Both want real block
+  # semantics — do NOT point this at a shared filesystem like CephFS or NFS.
+  storageClass: ""
+  # -- Create the namespaces. Set false if you manage them yourself (e.g. with ArgoCD/Flux, or
+  # when they already carry labels such as Pod Security Standards you don't want overwritten).
+  createNamespaces: true
+
+# =====================================================================================
+# Kafka — Strimzi, KRaft mode (no ZooKeeper)
+# =====================================================================================
+kafka:
+  enabled: true
+  namespace: kafka
+  # -- Strimzi cluster name. Drives the bootstrap service name:
+  # <clusterName>-kafka-bootstrap.<namespace>.svc.cluster.local:9092
+  clusterName: kafka
+
+  version: 4.2.0
+  # -- Must be compatible with `version`. Changing this is a one-way upgrade: bump it only
+  # AFTER every broker is running the new version.
+  metadataVersion: 4.2-IV1
+
+  # -- Dual-role nodes: each is BOTH a KRaft controller and a broker, so one pool keeps both a
+  # metadata quorum and replica leadership through the loss of any single node.
+  #
+  # Keep this odd and >= 3. With 3 you tolerate one node down; with 1 you have no quorum and no
+  # replication, which is fine only for a throwaway dev cluster.
+  replicas: 3
+
+  storage:
+    size: 20Gi
+    storageClass: ""        # falls back to global.storageClass
+    # -- Keep the PVCs when the pool is scaled down or deleted. Changing to true means a
+    # `helm uninstall` destroys your data.
+    deleteClaim: false
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      memory: 2Gi
+
+  # -- Spread brokers across worker nodes so losing one host cannot break the KRaft quorum.
+  # Soft (preferred), so scheduling still succeeds when nodes < replicas.
+  podAntiAffinity: true
+
+  config:
+    # -- RF 3 with min.insync 2: tolerate one broker down while still requiring two in-sync
+    # acks. If you set replicas: 1 you MUST drop these to 1 or every topic creation fails.
+    offsetsTopicReplicationFactor: 3
+    transactionStateLogReplicationFactor: 3
+    transactionStateLogMinIsr: 2
+    defaultReplicationFactor: 3
+    minInsyncReplicas: 2
+
+  # -- Extra entries merged verbatim into spec.kafka.config. Last word.
+  extraConfig: {}
+
+  listeners:
+    # -- In-cluster plaintext on :9092. This is what in-cluster consumers use.
+    plain: true
+    # -- In-cluster TLS on :9093.
+    tls: true
+    external:
+      # -- A LoadBalancer listener for producers OUTSIDE the cluster (an edge device, a sensor).
+      # Disabled by default because the default below is unauthenticated.
+      enabled: false
+      # -- Listener name. It appears in the Kafka CR status, which is how you read the assigned
+      # bootstrap address, so anything already scripted against a specific name must keep it:
+      # renaming a listener makes Strimzi reconfigure the brokers.
+      name: external
+      port: 9094
+      type: loadbalancer
+      # -- ⚠️ tls:false + no auth means anyone who can reach the LB IP can read and write every
+      # topic. Only acceptable on a genuinely trusted segment. For anything else set tls: true
+      # and add `authentication: {type: scram-sha-512}` via extraListenerConfig, then create a
+      # KafkaUser for the producer.
+      tls: false
+      # -- Merged into the listener entry verbatim (e.g. authentication, configuration/bootstrap
+      # annotations for a fixed LB IP).
+      extraListenerConfig: {}
+
+  metrics:
+    # -- Expose broker JMX as Prometheus metrics on :9404 using the vendored Strimzi exporter
+    # rules in files/kafka-metrics-config.yml.
+    enabled: true
+    # -- Consumer-group lag / offset metrics as a separate exporter Deployment. This is the one
+    # that tells you whether a consumer is falling behind — usually the first thing you want.
+    kafkaExporter:
+      enabled: true
+      topicRegex: ".*"
+      groupRegex: ".*"
+
+  entityOperator:
+    # -- Manage topics declaratively as KafkaTopic CRs.
+    topicOperator: true
+    # -- Manage users and ACLs declaratively as KafkaUser CRs.
+    userOperator: true
+
+  # -- Topics to create. Each becomes a KafkaTopic CR the Topic Operator reconciles.
+  topics:
+    - name: smoke-test
+      partitions: 3
+      replicas: 3
+      config:
+        retention.ms: "604800000"   # 7 days
+
+# =====================================================================================
+# Flink — a long-running SESSION cluster you submit many jobs to
+# =====================================================================================
+flink:
+  enabled: true
+  namespace: flink
+  name: session
+
+  image: flink:2.2
+  # -- Must match the image's Flink minor version.
+  flinkVersion: v2_2
+  # -- ServiceAccount in this namespace. The Flink operator's own Helm chart creates `flink`.
+  serviceAccount: flink
+
+  taskSlotsPerTaskManager: 2
+
+  highAvailability:
+    # -- Two JobManagers (active + standby) with leader election via ConfigMaps.
+    #
+    # ⚠️ jobManagerReplicas > 1 REQUIRES this enabled AND a storageDir on real object storage.
+    # On a POSIX volume the JobManagers race on Flink's JobResultStore; S3-style concurrent
+    # object storage is what makes two JMs safe.
+    enabled: true
+    type: kubernetes
+    storageDir: s3://flink/ha
+
+  jobManagerReplicas: 2
+
+  state:
+    checkpointsDir: s3://flink/checkpoints
+    savepointsDir: s3://flink/savepoints
+
+  checkpointing:
+    interval: 10s
+
+  restartStrategy: exponential-delay
+
+  s3:
+    # -- S3-compatible object storage for HA, checkpoints and savepoints.
+    enabled: true
+    # -- Custom endpoint for a non-AWS implementation (MinIO, Ceph RGW). Leave empty for AWS S3.
+    endpoint: ""
+    # -- Required by most non-AWS implementations.
+    pathStyleAccess: true
+    # -- Existing Secret with the credentials, injected through the standard AWS_* env chain so
+    # no keys live in this values file. Create it out of band.
+    existingSecret: flink-s3
+    accessKeyKey: access-key
+    secretKeyKey: secret-key
+    # -- Activates the bundled S3 filesystem plugin at startup. The jar name must exist in
+    # /opt/flink/opt/ in your image — it is version-specific, so it changes when `image` does.
+    builtInPlugin: flink-s3-fs-presto-2.2.1.jar
+
+  resources:
+    jobManager:
+      memory: "2048m"
+      cpu: 1
+    taskManager:
+      memory: "2048m"
+      cpu: 1
+
+  # -- Spread a job's parallel TaskManagers across distinct nodes, so its subtasks genuinely
+  # exchange data over the network and one node failing cannot take out every subtask.
+  podAntiAffinity: true
+
+  metrics:
+    prometheus:
+      enabled: true
+      port: 9249
+
+  ingress:
+    # -- Flink's web UI and REST endpoint (job graph, metrics, logs, job submission).
+    #
+    # ⚠️ The REST endpoint is UNAUTHENTICATED and accepts job submissions — anyone who can reach
+    # it can run arbitrary code on your cluster. Only expose it somewhere you trust, or put an
+    # authenticating proxy in front.
+    enabled: false
+    className: nginx
+    host: ""
+    annotations: {}
+    tls:
+      enabled: false
+      secretName: ""
+
+  # -- Merged into flinkConfiguration verbatim. Last word — overrides everything above.
+  extraConfiguration: {}
+
+# =====================================================================================
+# Elasticsearch — single node
+# =====================================================================================
+elasticsearch:
+  enabled: true
+  namespace: elastic
+  image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
+
+  # -- single-node also bypasses ES's bootstrap checks, so a low vm.max_map_count on the node
+  # (65530, vs the 262144 ES wants in production mode) does not block startup. Fine for modest
+  # data; raise the node sysctl and move to a real multi-node topology if it grows.
+  singleNode: true
+
+  security:
+    # -- ⚠️ false means plain HTTP with NO authentication. Anyone who can reach :9200 can read,
+    # write and DELETE every index. Acceptable only on a trusted LAN. Set true for anything else
+    # (and then give Kibana credentials via kibana.elasticsearch.existingSecret).
+    enabled: false
+
+  # -- JVM heap. Keep at roughly half the memory limit and set Xms == Xmx.
+  javaOpts: "-Xms1g -Xmx1g"
+
+  storage:
+    size: 20Gi
+    storageClass: ""        # falls back to global.storageClass
+
+  resources:
+    requests:
+      cpu: 500m
+      memory: 2Gi
+    limits:
+      memory: 2Gi
+
+  extraEnv: []
+
+# =====================================================================================
+# Kibana
+# =====================================================================================
+kibana:
+  enabled: true
+  # -- MUST match the Elasticsearch version exactly.
+  image: docker.elastic.co/kibana/kibana:8.17.0
+
+  # -- External URL, used for SERVER_PUBLICBASEURL/SERVER_NAME. Set this when using an ingress;
+  # Kibana warns and some features misbehave without it.
+  publicBaseUrl: ""
+
+  elasticsearch:
+    # -- Defaults to the in-chart Elasticsearch service. Override to point at an external one.
+    hosts: ""
+    # -- Secret with `username` / `password`, used when elasticsearch.security.enabled is true.
+    existingSecret: ""
+
+  resources:
+    requests:
+      cpu: 200m
+      memory: 1Gi
+    limits:
+      memory: 1536Mi
+
+  ingress:
+    enabled: false
+    className: nginx
+    host: ""
+    annotations: {}
+    tls:
+      enabled: false
+      secretName: ""
+
+  extraEnv: []

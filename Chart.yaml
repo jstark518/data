@@ -1,0 +1,33 @@
+apiVersion: v2
+name: streaming-platform
+description: >-
+  A Kafka to Flink to Elasticsearch streaming substrate: a Strimzi Kafka cluster in KRaft mode,
+  a highly-available Flink session cluster you submit jobs to, and single-node Elasticsearch
+  with Kibana for ad-hoc search and dashboards. Bring your own jobs.
+type: application
+
+# Chart version — bump on every chart change.
+version: 0.1.0
+# The platform these defaults were verified against (Kafka 4.2.0 / Flink 2.2 / Elastic 8.17.0).
+appVersion: "1.0.0"
+
+keywords:
+  - kafka
+  - strimzi
+  - flink
+  - elasticsearch
+  - kibana
+  - streaming
+
+maintainers:
+  - name: Jonathan Stark
+
+annotations:
+  # NOT installed by this chart — they must already be on the cluster. See README "Prerequisites".
+  # The chart deploys custom resources those operators reconcile; without them, the Kafka and
+  # Flink resources will be rejected by the API server.
+  requires: >-
+    Strimzi Kafka operator (kafka.strimzi.io/v1, i.e. Strimzi 1.0+),
+    Flink Kubernetes operator 1.15+,
+    a block StorageClass (ReadWriteOnce),
+    and for the optional ingresses an ingress controller and cert-manager.

@@ -1,0 +1,19 @@
+{{- if .Values.global.createNamespaces }}
+{{- $namespaces := list }}
+{{- if .Values.kafka.enabled }}{{ $namespaces = append $namespaces .Values.kafka.namespace }}{{ end }}
+{{- if .Values.flink.enabled }}{{ $namespaces = append $namespaces .Values.flink.namespace }}{{ end }}
+{{- if or .Values.elasticsearch.enabled .Values.kibana.enabled }}{{ $namespaces = append $namespaces .Values.elasticsearch.namespace }}{{ end }}
+{{- range $ns := $namespaces | uniq }}
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ $ns }}
+  labels:
+    {{- include "streaming-platform.labels" $ | nindent 4 }}
+  annotations:
+    # Keep the namespaces when the release is uninstalled. Deleting a namespace deletes
+    # everything in it, PersistentVolumeClaims included — far too blunt for `helm uninstall`.
+    helm.sh/resource-policy: keep
+{{- end }}
+{{- end }}
